@@ -1,91 +1,144 @@
-# app.py (updated) — Streamlit Dice/Limbo Martingale Calculator
 import streamlit as st
 import math
+import pandas as pd
+import io
 
-def compute_martingale(balance, base_bet, payout, chance, multiplier, house_edge):
-    p = chance / 100
-    q = 1 - p
+# =========================
+# Helper functions
+# =========================
+def fmt(value, dec=8):
+    if value is None or math.isnan(value) or math.isinf(value):
+        return "—"
+    s = f"{value:.{dec}f}"
+    s = s.rstrip("0").rstrip(".")
+    return s
+
+def fmt_prob(prob):
+    if prob <= 0:
+        return "0.00%"
+    if prob >= 1:
+        return "100.00%"
+    return f"{prob*100:.8f}".rstrip("0").rstrip(".") + "%"
+
+def human_odds(prob):
+    if prob <= 0:
+        return "—"
+    val = 1 / prob
+    if val >= 1e6:
+        return f"1:{val/1e6:.3f}M"
+    if val >= 1e3:
+        return f"1:{val/1e3:.3f}K"
+    return "1:" + fmt(val, 4)
+
+def implied_chance(payout, house_edge):
     actual_payout = payout * (1 - house_edge / 100)
+    if actual_payout <= 1e-12:
+        return 0.0
+    chance = 100.0 / actual_payout
+    return max(min(chance, 100.0), 0.0)
 
-    # Tính L
-    if multiplier <= 1:
-        L = math.floor(balance / base_bet)
-    else:
-        RHS = (balance * (multiplier - 1) / base_bet) + 1
-        # guard against negative/zero
-        if RHS <= 1:
-            L = 0
-        else:
-            L = math.floor(math.log(RHS) / math.log(multiplier))
+def compute_L(balance, base_bet, multiplier):
+    if base_bet <= 0:
+        return 0
+    if multiplier <= 1 + 1e-12:
+        return math.floor(balance / base_bet)
+    rhs = (balance * (multiplier - 1) / base_bet) + 1
+    if rhs <= 1:
+        return 0
+    return max(0, math.floor(math.log(rhs) / math.log(multiplier)))
 
-    bust_prob = q ** (L + 1)
-    profit_per_win = base_bet * (actual_payout - 1)
-    return L, bust_prob, profit_per_win, actual_payout
-
+# =========================
+# Streamlit app
+# =========================
 st.set_page_config(page_title="Dice / Limbo Martingale Calculator", layout="wide")
-st.title("🎲 Máy tính xác suất Dice / Limbo - Martingale (with sync)")
+st.title("🎲 Dice / Limbo Martingale Calculator (Antebot-like)")
 
 st.markdown("""
-Công cụ tính xác suất phá sản & chuỗi thua tối đa với tùy chọn **đồng bộ Chance ↔ Payout**.
-- Bật `Sync chance with payout` để khi thay đổi Payout hoặc House Edge, Chance sẽ được cập nhật tự động theo công thức implied chance.
+Công cụ tính toán chiến lược **Martingale** cho game Dice hoặc Limbo:
+- Tính số lần thua liên tiếp tối đa (L).
+- Hiển thị bảng chi tiết từng mức cược, tổng cược, lợi nhuận, xác suất.
+- Xuất dữ liệu ra CSV.
+
+⚠️ **Lưu ý:** Các con số chỉ mang tính tham khảo, bạn tự chịu trách nhiệm với vốn của mình.
 """)
 
-# layout
+# === Input Layout ===
 col1, col2 = st.columns(2)
 
 with col1:
     balance = st.number_input("💰 Balance (Vốn)", value=0.00200000, format="%.8f")
     base_bet = st.number_input("🎯 Base Bet (Cược cơ bản)", value=0.00000001, format="%.8f")
     payout = st.number_input("💵 Payout (Thanh toán)", value=2.00, format="%.4f")
+    house_edge = st.number_input("🏠 House Edge (%)", value=1.00, format="%.2f")
+    sync = st.checkbox("🔗 Sync Chance with Payout (implied fair chance)", value=True,
+                       help="Khi bật, Chance sẽ tự tính từ Payout và House Edge theo công thức implied fair chance.")
 
 with col2:
-    # sync checkbox stored in session_state
-    if 'sync' not in st.session_state:
-        st.session_state.sync = True
-    sync = st.checkbox("🔗 Sync chance with payout (implied fair chance)", value=st.session_state.sync,
-                       help="When on, changing Payout or House Edge updates Chance to the implied fair value (1/actual_payout).")
-    st.session_state.sync = sync
-
-    house_edge = st.number_input("🏠 House Edge (%)", value=1.00, format="%.2f")
-    multiplier = st.number_input("📈 Loss Multiplier (Tăng khi thua)", value=2.00, format="%.2f")
-
-    # Compute implied chance if sync is on
-    actual_payout = payout * (1 - house_edge / 100)
     if sync:
-        if actual_payout > 1e-12:
-            implied_chance = 100.0 / actual_payout
-            # clamp implied_chance to (0,100]
-            implied_chance = max(min(implied_chance, 100.0), 0.0000001)
-        else:
-            implied_chance = 0.0000001
-        # Show chance as number_input but keep in sync (disabled editing while sync on)
-        chance = st.number_input("🎲 Chance (%)", value=implied_chance, format="%.6f", disabled=True)
-        st.caption(f"Implied chance = 100 / (payout * (1 - house_edge/100)) = {implied_chance:.6f}%")
+        implied = implied_chance(payout, house_edge)
+        chance = implied
+        st.number_input("🎲 Chance (%)", value=chance, format="%.6f", disabled=True)
+        st.caption(f"Implied chance = 100 / (payout × (1 - house_edge/100)) = {chance:.6f}%")
     else:
-        # not synced: let user edit chance freely
         chance = st.number_input("🎲 Chance (%)", value=49.5, format="%.6f")
 
-# Calculate when button pressed
-if st.button("Tính toán"):
-    L, bust_prob, profit_per_win, actual_payout = compute_martingale(
-        balance, base_bet, payout, chance, multiplier, house_edge
-    )
+    mult_type = st.selectbox("Đơn vị multiplier", ["%", "factor"], index=0)
+    if mult_type == "%":
+        mult_percent = st.number_input("📈 Increase on Loss (%)", value=100.0, format="%.2f")
+        multiplier = 1 + mult_percent / 100
+    else:
+        multiplier = st.number_input("📈 Increase on Loss (factor)", value=2.00, format="%.2f")
 
-    st.subheader("📊 Kết quả tính toán")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Số lần thua tối đa (L)", f"{L}")
-    c2.metric("Xác suất phá sản (%)", f"{bust_prob*100:.6f}")
-    c3.metric("Lợi nhuận mỗi lần thắng", f"{profit_per_win:.8f}")
+    max_rows = st.number_input("Số dòng hiển thị (Max Rows)", value=30, step=1, min_value=1)
 
-    st.write("---")
-    st.markdown(f"""
-    - Balance = **{balance:.8f}**, Base Bet = **{base_bet:.8f}**  
-    - Chance = **{chance:.6f}%**, Payout = **{payout:.4f}**, House Edge = **{house_edge:.2f}%**  
-    - Loss Multiplier = **{multiplier:.2f}**  
-    - Payout sau house edge = **{actual_payout:.6f}**  
-    - Bạn có thể chịu được **{L} lần thua liên tiếp** trước khi phá sản.  
-    - Xác suất thua liên tiếp **{L+1} lần** (phá sản) ≈ **{bust_prob*100:.6f}%**
-    """)
+# === Calculation ===
+p = chance / 100
+q = 1 - p
+L = compute_L(balance, base_bet, multiplier)
+bust_prob = q ** (L + 1)
 
 st.markdown("---")
-st.caption("© 2025 Dice/Limbo Martingale Calculator — Updated")
+st.subheader("📊 Kết quả")
+st.write(f"""
+Với **Balance** = {fmt(balance,8)}, **Base Bet** = {fmt(base_bet,8)}, **Chance** = {fmt(chance,6)}%, 
+**Multiplier** = {fmt(multiplier,4)}:
+- Bạn có thể chịu được **{L} lần thua liên tiếp** trước khi phá sản.
+- Xác suất thua liên tiếp **{L+1} lần** (phá sản) ≈ **{bust_prob*100:.8f}%**
+""")
+
+# === Build Table ===
+total_bet = 0.0
+rows = []
+for i in range(1, int(max_rows) + 1):
+    bet = base_bet * (multiplier ** (i - 1))
+    total_bet += bet
+    profit = bet * (payout - 1)
+    net_profit = profit - (total_bet - bet)
+    prob = q ** i
+    rows.append({
+        "Loss": i,
+        "Bet Amount": fmt(bet, 8),
+        "Total Bet": fmt(total_bet, 8),
+        "Profit": fmt(profit, 8),
+        "Net Profit": fmt(net_profit, 8),
+        "Probability": fmt_prob(prob),
+        "Odds": human_odds(prob)
+    })
+
+df = pd.DataFrame(rows)
+
+st.dataframe(df, use_container_width=True)
+
+# === Export CSV ===
+csv_buffer = io.StringIO()
+df.to_csv(csv_buffer, index=False)
+
+st.download_button(
+    label="📥 Export CSV",
+    data=csv_buffer.getvalue(),
+    file_name="martingale_calculator.csv",
+    mime="text/csv",
+)
+
+st.markdown("---")
+st.caption("© 2025 Dice/Limbo Martingale Calculator — Streamlit version")
